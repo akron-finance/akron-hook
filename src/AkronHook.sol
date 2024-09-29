@@ -81,17 +81,17 @@ contract AkronHook is BaseHook, Ownable {
         override
         returns (bytes4)
     {
-        // if (key.fee != 0) revert FeeNotDefault();
-        // if (key.tickSpacing != 60) revert TickSpacingNotDefault();
-        // string memory tokenSymbol = string(
-        //     abi.encodePacked(
-        //         "Akron-",
-        //         IERC20Metadata(Currency.unwrap(key.currency0)).symbol(), 
-        //         "-",
-        //         IERC20Metadata(Currency.unwrap(key.currency1)).symbol()
-        //     )
-        // );
-        // poolStates[key.toId()].liquidityToken = address(new UniswapV4ERC20(tokenSymbol, tokenSymbol));
+        if (key.fee != 0) revert FeeNotDefault();
+        if (key.tickSpacing != 60) revert TickSpacingNotDefault();
+        string memory tokenSymbol = string(
+            abi.encodePacked(
+                "Akron-",
+                IERC20Metadata(Currency.unwrap(key.currency0)).symbol(), 
+                "-",
+                IERC20Metadata(Currency.unwrap(key.currency1)).symbol()
+            )
+        );
+        poolStates[key.toId()].liquidityToken = address(new UniswapV4ERC20(tokenSymbol, tokenSymbol));
         return IHooks.beforeInitialize.selector;
     }
 
