@@ -68,13 +68,12 @@ contract AkronHook is BaseHook, Ownable {
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: true,
+            beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
     }
-
 
     /// @notice Checks default values and deploys liquidity token for full range liquidity providers
     function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
@@ -82,17 +81,17 @@ contract AkronHook is BaseHook, Ownable {
         override
         returns (bytes4)
     {
-        if (key.fee != 0) revert FeeNotDefault();
-        if (key.tickSpacing != 60) revert TickSpacingNotDefault();
-        string memory tokenSymbol = string(
-            abi.encodePacked(
-                "Akron-",
-                IERC20Metadata(Currency.unwrap(key.currency0)).symbol(), 
-                "-",
-                IERC20Metadata(Currency.unwrap(key.currency1)).symbol()
-            )
-        );
-        poolStates[key.toId()].liquidityToken = address(new UniswapV4ERC20(tokenSymbol, tokenSymbol));
+        // if (key.fee != 0) revert FeeNotDefault();
+        // if (key.tickSpacing != 60) revert TickSpacingNotDefault();
+        // string memory tokenSymbol = string(
+        //     abi.encodePacked(
+        //         "Akron-",
+        //         IERC20Metadata(Currency.unwrap(key.currency0)).symbol(), 
+        //         "-",
+        //         IERC20Metadata(Currency.unwrap(key.currency1)).symbol()
+        //     )
+        // );
+        // poolStates[key.toId()].liquidityToken = address(new UniswapV4ERC20(tokenSymbol, tokenSymbol));
         return IHooks.beforeInitialize.selector;
     }
 
