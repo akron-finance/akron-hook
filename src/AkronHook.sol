@@ -4,51 +4,34 @@ pragma solidity ^0.8.0;
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
-import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {SafeCast} from "v4-core/libraries/SafeCast.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
-import {TransferHelper} from "./libraries/TransferHelper.sol";
-import {UniswapV4ERC20} from "./libraries/UniswapV4ERC20.sol";
+import {IUniswapV2Pair} from "./interfaces/external/IUniswapV2Pair.sol";
+import {IWETH} from "./interfaces/external/IWETH.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
-import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 
-contract AkronHook is BaseHook, Ownable {
+contract AkronHook is BaseHook {
     using Hooks for IHooks;
-    using StateLibrary for IPoolManager;
     using CurrencyLibrary for Currency;
     using SafeCast for uint256;
     using PoolIdLibrary for PoolKey;
     
     /// @notice Thrown when trying to interact with a non-initialized pool
-    error FeeNotDefault();
-    error TickSpacingNotDefault();
-    error HookSwapFeeBipsTooLarge();
-    error MultipleZeroForOneSwapNotAllowedPerBlock();
-    error MultipleOneForZeroSwapNotAllowedPerBlock();
+    error MustAddLiquidityToAkronswap();
 
-    IPoolManager internal immutable manager;
+    IPoolManager public immutable manager;
+    address public immutable factory;
+    address public immutable WETH;
 
-    struct PoolState {
-        uint256 zeroForOneBlockNumber;
-        uint256 oneForZeroBlockNumber;
-        address liquidityToken;
-        uint128 swapFeeBips;
-    }
-    
-    // poolStates[poolId] => AkronHook.PoolState
-    mapping(PoolId => PoolState) public poolStates;
-
-    constructor(address _manager) BaseHook(IPoolManager(_manager)) Ownable(msg.sender) {
-        manager = IPoolManager(_manager);
+    constructor(IPoolManager _manager, address _factory, address _WETH) BaseHook(_manager) {
+        manager = _manager;
+        factory = _factory;
+        WETH = _WETH;
     }
 
     modifier onlyManager() {
@@ -58,151 +41,145 @@ contract AkronHook is BaseHook, Ownable {
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: true,
+            beforeInitialize: false,
             afterInitialize: false,
             beforeAddLiquidity: true,
             afterAddLiquidity: false,
-            beforeRemoveLiquidity: true,
+            beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
-            beforeSwap: true,
-            afterSwap: true,
+            beforeSwap: false,
+            afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
+            beforeSwapReturnDelta: true,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
     }
-
-    /// @notice Checks default values and deploys liquidity token for full range liquidity providers
-    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
-        external
-        override
-        returns (bytes4)
-    {
-        if (key.fee != 0) revert FeeNotDefault();
-        if (key.tickSpacing != 60) revert TickSpacingNotDefault();
-        string memory tokenSymbol = string(
-            abi.encodePacked(
-                "Akron-",
-                IERC20Metadata(Currency.unwrap(key.currency0)).symbol(), 
-                "-",
-                IERC20Metadata(Currency.unwrap(key.currency1)).symbol()
-            )
-        );
-        poolStates[key.toId()].liquidityToken = address(new UniswapV4ERC20(tokenSymbol, tokenSymbol));
-        return IHooks.beforeInitialize.selector;
-    }
-
-    /// @notice Mints liquidity token to full range liquidity providers 
-    function beforeAddLiquidity(
-        address sender, PoolKey calldata key, IPoolManager.ModifyLiquidityParams calldata params, bytes calldata
-    ) external override onlyManager returns (bytes4) {
-        if (params.tickLower == -887220 && params.tickUpper == 887220)
-            UniswapV4ERC20(poolStates[key.toId()].liquidityToken).mint(sender, uint256(params.liquidityDelta));
-        return IHooks.beforeAddLiquidity.selector;
-    }
-
-    /// @notice Burns liquidity token from full range liquidity providers 
-    function beforeRemoveLiquidity(
-        address sender, PoolKey calldata key, IPoolManager.ModifyLiquidityParams calldata params, bytes calldata
-    ) external override onlyManager returns (bytes4) {
-        if (params.tickLower == -887220 && params.tickUpper == 887220) 
-            UniswapV4ERC20(poolStates[key.toId()].liquidityToken).burn(sender, uint256(-params.liquidityDelta));
-        return IHooks.beforeRemoveLiquidity.selector;
-    }
-
-    /// @notice Reverts if the swap is not the first zeroForOne or oneForZero swap of the block.
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
-        external
-        override
-        onlyManager
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
-        PoolId poolId = key.toId();
-
-        uint256 blockNumber = block.number;
-
-        if (params.zeroForOne) {
-            if (poolStates[poolId].zeroForOneBlockNumber == blockNumber) 
-                revert MultipleZeroForOneSwapNotAllowedPerBlock();
-            poolStates[poolId].zeroForOneBlockNumber = blockNumber;
-        } else {
-            if (poolStates[poolId].oneForZeroBlockNumber == blockNumber) 
-                revert MultipleOneForZeroSwapNotAllowedPerBlock();
-            poolStates[poolId].oneForZeroBlockNumber = blockNumber;
-        }
-        
-        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-    }
-
+    
     struct StepComputations {
+        bool exactInput;
         bool specifiedTokenIs0;
-        uint256 sqrtPriceX96;
-        uint256 oldSwapAmount;
-        uint256 newSwapAmount;
-        uint256 feeAmount;
-        uint256 hookFeeAmount;
-        Currency feeCurrency;
+        Currency specified;
+        Currency unspecified;
+        uint256 specifiedAmount;
+        uint256 unspecifiedAmount;
+        address pair;
+        uint112 _reserve0;
+        uint112 _reserve1;
+        BeforeSwapDelta returnDelta;
     }
 
-    /// @notice From the total dynamic swap fee, donates LP's swap fee and takes hook's swap fee.
-    function afterSwap(
-        address, PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta, bytes calldata
-    ) external override onlyManager returns (bytes4, int128) {
+    function beforeSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
         StepComputations memory step;
-        (uint160 sqrtPriceX96,,,) = manager.getSlot0(key.toId());
-        step.sqrtPriceX96 = sqrtPriceX96;
+        step.exactInput = params.amountSpecified < 0;
+        step.specifiedTokenIs0 = (step.exactInput == params.zeroForOne);
+        (step.specified, step.unspecified) =
+            step.specifiedTokenIs0 ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
 
-        // dynamic swap fee will be in the unspecified token of the swap
-        step.specifiedTokenIs0 = (params.amountSpecified < 0 == params.zeroForOne);
+        step.specifiedAmount = step.exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+
+        step.pair = _pairFor(
+            Currency.unwrap(key.currency0.isNative() ? Currency.wrap(WETH) : key.currency0), Currency.unwrap(key.currency1)
+        );
+        (step._reserve0, step._reserve1, ) = IUniswapV2Pair(step.pair).getReserves();
         
-        if (step.specifiedTokenIs0) {
-            step.oldSwapAmount = uint256(uint128(delta.amount1() < 0 ? -delta.amount1() : delta.amount1()));
-            if (delta.amount0() < 0) {
-                step.newSwapAmount = _mulDiv(uint256(uint128(-delta.amount0())), step.sqrtPriceX96, FixedPoint96.Q96, false);
-                step.feeAmount = step.oldSwapAmount - step.newSwapAmount;
+        if (step.exactInput) {
+            // in exact-input swaps, the specified token is a debt that gets paid down by the swapper
+            // the unspecified token is credited to the PoolManager, that is claimed by the swapper
+            if (step.specifiedTokenIs0) {
+                step.unspecifiedAmount = _getAmountOut(step.specifiedAmount, uint256(step._reserve0), uint256(step._reserve1));
+                _take(step.specified, step.pair, step.specifiedAmount);
+                IUniswapV2Pair(step.pair).swap(0, step.unspecifiedAmount, address(this), new bytes(0));
+                manager.sync(step.unspecified);
+                IERC20Minimal(Currency.unwrap(step.unspecified)).transfer(address(manager), step.unspecifiedAmount);
+                manager.settle();
             } else {
-                step.newSwapAmount = _mulDiv(uint256(uint128(delta.amount0())), step.sqrtPriceX96, FixedPoint96.Q96, true);
-                step.feeAmount = step.newSwapAmount - step.oldSwapAmount;
+                step.unspecifiedAmount = _getAmountOut(step.specifiedAmount, uint256(step._reserve1), uint256(step._reserve0));
+                manager.take(step.specified, step.pair, step.specifiedAmount);
+                IUniswapV2Pair(step.pair).swap(step.unspecifiedAmount, 0, address(this), new bytes(0));
+                _settle(step.unspecified, step.unspecifiedAmount);
             }
-            step.feeCurrency = key.currency1;
+            step.returnDelta = toBeforeSwapDelta(step.specifiedAmount.toInt128(), -step.unspecifiedAmount.toInt128());
         } else {
-            step.oldSwapAmount = uint256(uint128(delta.amount0() < 0 ? -delta.amount0() : delta.amount0()));
-            if (delta.amount1() < 0) {
-                step.newSwapAmount = _mulDiv(uint256(uint128(-delta.amount0())), FixedPoint96.Q96, step.sqrtPriceX96, false);
-                step.feeAmount = step.oldSwapAmount - step.newSwapAmount;
+            // in exact-output swaps, the unspecified token is a debt that gets paid down by the swapper
+            // the specified token is credited to the PoolManager, that is claimed by the swapper
+            if (step.specifiedTokenIs0) {
+                step.unspecifiedAmount = _getAmountIn(step.specifiedAmount, uint256(step._reserve1), uint256(step._reserve0));
+                manager.take(step.unspecified, step.pair, step.unspecifiedAmount);
+                IUniswapV2Pair(step.pair).swap(step.specifiedAmount, 0, address(this), new bytes(0));
+                _settle(step.specified, step.specifiedAmount);
             } else {
-                step.newSwapAmount = _mulDiv(uint256(uint128(delta.amount1())), FixedPoint96.Q96, step.sqrtPriceX96, true);
-                step.feeAmount = step.newSwapAmount - step.oldSwapAmount;
+                step.unspecifiedAmount = _getAmountIn(step.specifiedAmount, uint256(step._reserve0), uint256(step._reserve1));
+                _take(step.unspecified, step.pair, step.unspecifiedAmount);
+                IUniswapV2Pair(step.pair).swap(0, step.specifiedAmount, address(this), new bytes(0));
+                manager.sync(step.specified);
+                IERC20Minimal(Currency.unwrap(step.specified)).transfer(address(manager), step.specifiedAmount);
+                manager.settle();
             }
-            step.feeCurrency = key.currency1;
+            
+            step.returnDelta = toBeforeSwapDelta(-step.specifiedAmount.toInt128(), step.unspecifiedAmount.toInt128());
         }
         
-        step.hookFeeAmount = step.feeAmount * poolStates[key.toId()].swapFeeBips / 10000;
-        manager.donate(key, 0, step.feeAmount - step.hookFeeAmount, bytes(""));
-        if (step.hookFeeAmount > 0) manager.take(step.feeCurrency , address(this), step.hookFeeAmount);
+        return (BaseHook.beforeSwap.selector, step.returnDelta, 0);
 
-        return (IHooks.afterSwap.selector, step.feeAmount.toInt128());
     }
 
-    /// @notice Sets hook swap fee bips.
-    function setSwapFeeBips(PoolKey calldata key, uint8 bips) external onlyOwner{
-        if (bips < 1000) revert HookSwapFeeBipsTooLarge(); // 10%
-        poolStates[key.toId()].swapFeeBips = bips;
+
+    function beforeAddLiquidity(
+        address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata
+    ) external view override onlyPoolManager returns (bytes4) {
+        revert MustAddLiquidityToAkronswap();
     }
 
-    /// @notice Claims accrued hook swap fees.
-    function claimTokens(Currency token, address to, uint256 amountRequested) external onlyOwner {
-        Currency(token).transfer(to, amountRequested);
+
+    // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint amountOut) {
+        amountOut = reserveOut * amountIn / ((amountIn * 2) + reserveIn);
     }
 
-    function _mulDiv(uint256 a, uint256 b, uint256 c, bool roundingUp) internal pure returns (uint256) {
-        if (roundingUp) {
-            return FullMath.mulDivRoundingUp(FullMath.mulDivRoundingUp(a, b, c), b, c);
+    // given an output amount of an asset and pair reserves, returns a required input amount of the other asset
+    function _getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint amountIn) {
+        amountIn = (reserveIn * amountOut / (reserveOut - (amountOut * 2))) + 1;
+    }
+
+    // calculates the CREATE2 address for a pair without making any external calls
+    function _pairFor(address tokenA, address tokenB) internal view returns (address pair) {
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        pair = address(uint160(uint256((keccak256(abi.encodePacked(
+                hex'ff',
+                factory,
+                keccak256(abi.encodePacked(token0, token1)),
+                hex'207e00cb099b76f581c479b9e20c11280ed52e93ab7003d58600ec82fb71b23b' // init code hash 
+            ))))));
+    }
+
+    function _settle(Currency currency, uint256 amount) internal {
+        // for native currencies, calling sync is not required
+        if (currency.isNative()) {
+            manager.settle{value: amount}();
         } else {
-            return FullMath.mulDiv(FullMath.mulDiv(a, b, c), b, c);
+            manager.sync(currency);
+            IERC20Minimal(Currency.unwrap(currency)).transfer(address(manager), amount);
+            manager.settle();
         }
     }
+
+    function _take(Currency currency, address recipient, uint256 amount) internal {
+        if (currency.isNative()) {
+            manager.take(currency, address(this), amount);
+            IWETH(WETH).deposit{value: amount}();
+            IWETH(WETH).transfer(Currency.unwrap(currency), amount);
+        } else {
+            manager.take(currency, recipient, amount);
+        }
+    }
+
+    receive() external payable {}
 }
